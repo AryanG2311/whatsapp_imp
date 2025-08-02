@@ -3,7 +3,33 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode    = require('qrcode');
 
 const app = express();
-app.use(express.json());
+
+// 🔥 IMPROVED JSON MIDDLEWARE with error handling
+app.use(express.json({
+  limit: '10mb',
+  verify: (req, res, buf) => {
+    try {
+      if (buf && buf.length) JSON.parse(buf);
+    } catch (e) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid JSON in request body'
+      });
+      throw new Error('Invalid JSON');
+    }
+  }
+}));
+
+// 🔥 Global error handler for JSON parsing
+app.use((error, req, res, next) => {
+  if (error instanceof SyntaxError && error.status === 400 && 'body' in error) {
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid JSON format in request body'
+    });
+  }
+  next();
+});
 
 class WhatsAppAPI {
   constructor () {
@@ -21,6 +47,7 @@ class WhatsAppAPI {
 
   async logout () { 
     if (this.client) { 
+      console.log('🔓 Logging out...');
       await this.client.logout(); 
       await this.client.destroy();
       this.client = null;
@@ -42,7 +69,7 @@ class WhatsAppAPI {
         this.client = new Client({
           authStrategy   : new LocalAuth(),
           puppeteer      : {
-            headless : true,  // 🔥 CHANGED: Must be true for production
+            headless : true,
             args     : [
               '--no-sandbox',
               '--disable-setuid-sandbox',
@@ -84,10 +111,18 @@ class WhatsAppAPI {
       }
     });
 
+    // 🔥 IMPROVED: Better ready state handling
     this.client.on('ready', () => {
       this.isReady = true;
       this.qrText = this.qrImage = null;
       console.log('✅ WhatsApp session active');
+      
+      // 🔥 Force clear QR data after connection
+      setTimeout(() => {
+        if (this.isReady) {
+          this.qrText = this.qrImage = null;
+        }
+      }, 2000);
     });
 
     this.client.on('auth_failure', () => {
@@ -99,9 +134,32 @@ class WhatsAppAPI {
       console.log('❌ Client disconnected:', reason);
       this.reset();
     });
+
+    // 🔥 NEW: Additional connection monitoring
+    this.client.on('change_state', (state) => {
+      console.log(`🔄 WhatsApp state: ${state}`);
+      if (state === 'CONNECTED') {
+        this.isReady = true;
+        this.qrText = this.qrImage = null;
+      }
+    });
   }
 
-  getStatus () {
+  // 🔥 IMPROVED: Better status checking with actual client state
+  async getStatus () {
+    // Check actual client state if available
+    if (this.client) {
+      try {
+        const clientState = await this.client.getState();
+        if (clientState === 'CONNECTED') {
+          this.isReady = true;
+          this.qrText = this.qrImage = null;
+        }
+      } catch (error) {
+        console.log('⚠️ Could not get client state:', error.message);
+      }
+    }
+
     if (this.isReady) {
       return { 
         success: true,
@@ -136,7 +194,19 @@ class WhatsAppAPI {
   }
 
   async fetchLast24h (chatQuery = null) {
-    if (!this.isReady) throw new Error('Client not ready – generate and scan QR first');
+    // 🔥 IMPROVED: Check actual client state
+    if (!this.client) {
+      throw new Error('Client not initialized - generate QR first');
+    }
+
+    try {
+      const clientState = await this.client.getState();
+      if (clientState !== 'CONNECTED') {
+        throw new Error(`Client not connected (state: ${clientState}) - scan QR code first`);
+      }
+    } catch (error) {
+      throw new Error('Client not ready - generate and scan QR first');
+    }
 
     console.log('🔍 Fetching last 24h messages...');
     
@@ -166,6 +236,7 @@ class WhatsAppAPI {
         const filtered = msgs
           .filter(m => m.timestamp * 1000 >= since)
           .map(m => ({
+            messageId  : m.id.id,
             chatName   : c.name || 'Individual Chat',
             chatType   : c.isGroup ? 'Group' : 'Individual',
             from       : m.fromMe ? 'You' : (m.author || m.from),
@@ -192,15 +263,24 @@ class WhatsAppAPI {
 
 const wa = new WhatsAppAPI();
 
-// Routes (same as before)
+// 🔥 ROUTES with improved error handling
+
 app.post('/api/qr/generate', async (req, res) => {
   try {
-    if (wa.isReady) {
-      return res.json({
-        success: true,
-        status: 'ready',
-        message: 'WhatsApp already connected'
-      });
+    // Check if already connected
+    if (wa.client) {
+      try {
+        const state = await wa.client.getState();
+        if (state === 'CONNECTED') {
+          return res.json({
+            success: true,
+            status: 'ready',
+            message: 'WhatsApp already connected'
+          });
+        }
+      } catch (error) {
+        console.log('⚠️ Could not check client state:', error.message);
+      }
     }
 
     if (wa.initializing) {
@@ -213,12 +293,13 @@ app.post('/api/qr/generate', async (req, res) => {
 
     console.log('🔄 Starting WhatsApp client for QR generation...');
     await wa.initClient();
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 3000)); // Wait longer for QR generation
     
-    const status = wa.getStatus();
+    const status = await wa.getStatus();
     res.json(status);
 
   } catch (e) {
+    console.error('❌ QR Generate Error:', e.message);
     res.status(500).json({ 
       success: false, 
       error: e.message,
@@ -227,8 +308,8 @@ app.post('/api/qr/generate', async (req, res) => {
   }
 });
 
-app.get('/api/qr', (req, res) => {
-  const status = wa.getStatus();
+app.get('/api/qr', async (req, res) => {
+  const status = await wa.getStatus();
   res.json(status);
 });
 
@@ -252,13 +333,19 @@ app.post('/api/logout', async (req, res) => {
     await wa.logout();
     res.json({ success: true, message: 'Logged out successfully' });
   } catch (e) { 
+    console.error('❌ Logout Error:', e.message);
     res.status(500).json({ success: false, error: e.message }); 
   }
 });
 
 app.post('/api/messages/last24h', async (req, res) => {
   try {
-    const chatFilter = req.body?.chat || null;
+    // Handle empty or missing body gracefully
+    const requestBody = req.body || {};
+    const chatFilter = requestBody.chat || null;
+    
+    console.log('📡 Messages request received:', { chatFilter });
+    
     const messages = await wa.fetchLast24h(chatFilter);
     
     res.json({ 
@@ -268,8 +355,40 @@ app.post('/api/messages/last24h', async (req, res) => {
       messages: messages 
     });
   } catch (e) {
-    console.error('❌ API Error:', e.message);
+    console.error('❌ Messages API Error:', e.message);
     res.status(503).json({ success: false, error: e.message });
+  }
+});
+
+// 🔥 NEW: Debug endpoint to check actual client state
+app.get('/api/debug/status', async (req, res) => {
+  try {
+    let actualState = 'no_client';
+    let isConnected = false;
+    
+    if (wa.client) {
+      try {
+        actualState = await wa.client.getState();
+        isConnected = actualState === 'CONNECTED';
+      } catch (error) {
+        actualState = 'error: ' + error.message;
+      }
+    }
+    
+    res.json({
+      clientExists: !!wa.client,
+      internalReady: wa.isReady,
+      actualState: actualState,
+      isConnected: isConnected,
+      hasQR: !!wa.qrText,
+      initializing: wa.initializing
+    });
+  } catch (error) {
+    res.json({
+      error: error.message,
+      clientExists: !!wa.client,
+      internalReady: wa.isReady
+    });
   }
 });
 
@@ -277,14 +396,20 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'Server running',
     timestamp: new Date().toISOString(),
-    whatsapp: wa.getStatus()
+    whatsapp: wa.isReady ? { status: 'ready' } : { status: 'not_ready' }
   });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 WhatsApp API Server running on port ${PORT}`);
-  console.log(`📡 Production API endpoints available`);
+  console.log(`📡 API Endpoints:`);
+  console.log(`   POST /api/qr/generate - Generate QR code`);
+  console.log(`   GET  /api/qr - Check status`);
+  console.log(`   GET  /api/qr/image - Get QR image`);
+  console.log(`   POST /api/messages/last24h - Fetch messages`);
+  console.log(`   POST /api/logout - Logout`);
+  console.log(`   GET  /api/debug/status - Debug connection`);
 });
 
 process.on('SIGINT', async () => {
